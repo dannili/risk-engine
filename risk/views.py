@@ -14,7 +14,8 @@ from risk.serializers import (
 from risk.services import compute_input_hash
 
 
-class PortfolioCreateView(generics.CreateAPIView):
+# class PortfolioCreateView(generics.CreateAPIView):
+class PortfolioListCreateView(generics.ListCreateAPIView):
     queryset = Portfolio.objects.all()
     serializer_class = PortfolioSerializer
 
