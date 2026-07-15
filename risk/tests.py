@@ -3,8 +3,10 @@ from decimal import Decimal
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase
+from rest_framework.test import APIClient
 
 from risk.models import Portfolio, Position, PriceHistory, VarRun, VarResult
+from risk.services import compute_input_hash
 
 
 class PortfolioTests(TestCase):
@@ -107,3 +109,136 @@ class CascadeDeleteTests(TestCase):
         )
         run.delete()
         self.assertEqual(VarResult.objects.count(), 0)
+
+
+class ComputeInputHashTests(TestCase):
+    def test_normalizes_confidence_precision(self):
+        common = dict(
+            portfolio_id=1,
+            method="historical",
+            lookback_days=500,
+            as_of_date=datetime.date(2026, 7, 14),
+        )
+        self.assertEqual(
+            compute_input_hash(confidence=Decimal("0.95"), **common),
+            compute_input_hash(confidence=Decimal("0.950"), **common),
+        )
+
+    def test_different_inputs_produce_different_hashes(self):
+        common = dict(
+            portfolio_id=1,
+            method="historical",
+            confidence=0.95,
+            lookback_days=500,
+            as_of_date=datetime.date(2026, 7, 14),
+        )
+        self.assertNotEqual(
+            compute_input_hash(**{**common, "lookback_days": 250}),
+            compute_input_hash(**common),
+        )
+
+
+class PortfolioApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_create_portfolio(self):
+        response = self.client.post(
+            "/api/portfolios/", {"name": "Test", "base_currency": "USD"}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Portfolio.objects.count(), 1)
+
+
+class PositionApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.portfolio = Portfolio.objects.create(name="Test", base_currency="USD")
+
+    def test_create_position(self):
+        response = self.client.post(
+            f"/api/portfolios/{self.portfolio.id}/positions/",
+            {"ticker": "AAPL", "quantity": "10.5"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        position = self.portfolio.positions.get()
+        self.assertEqual(position.ticker, "AAPL")
+
+
+class VarRunSubmissionApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.portfolio = Portfolio.objects.create(name="Test", base_currency="USD")
+        self.url = f"/api/portfolios/{self.portfolio.id}/var-runs/"
+        self.payload = {
+            "method": "historical",
+            "confidence": 0.95,
+            "lookback_days": 500,
+            "as_of_date": "2026-07-14",
+        }
+
+    def test_returns_202_on_new_run(self):
+        response = self.client.post(self.url, self.payload, format="json")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["status"], "pending")
+        self.assertIn("run_id", response.data)
+        self.assertEqual(VarRun.objects.count(), 1)
+
+    def test_duplicate_submission_returns_200_with_same_run_id(self):
+        first = self.client.post(self.url, self.payload, format="json")
+        second = self.client.post(self.url, self.payload, format="json")
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.data["run_id"], first.data["run_id"])
+        self.assertEqual(VarRun.objects.count(), 1)
+
+    def test_confidence_precision_does_not_create_a_second_run(self):
+        first = self.client.post(self.url, self.payload, format="json")
+        second_payload = {**self.payload, "confidence": 0.950}
+        second = self.client.post(self.url, second_payload, format="json")
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.data["run_id"], first.data["run_id"])
+        self.assertEqual(VarRun.objects.count(), 1)
+
+
+class VarRunDetailApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.portfolio = Portfolio.objects.create(name="Test", base_currency="USD")
+
+    def test_pending_run_has_null_result(self):
+        run = VarRun.objects.create(
+            portfolio=self.portfolio,
+            confidence=0.95,
+            lookback_days=500,
+            as_of_date=datetime.date(2026, 7, 14),
+            input_hash="abc123",
+        )
+        response = self.client.get(f"/api/var-runs/{run.id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "pending")
+        self.assertIsNone(response.data["result"])
+
+    def test_complete_run_includes_result(self):
+        run = VarRun.objects.create(
+            portfolio=self.portfolio,
+            confidence=0.95,
+            lookback_days=500,
+            as_of_date=datetime.date(2026, 7, 14),
+            input_hash="abc123",
+            status=VarRun.Status.COMPLETE,
+        )
+        VarResult.objects.create(
+            var_run=run,
+            var_value=Decimal("1234.5"),
+            expected_shortfall=Decimal("1500.0"),
+            breach_count=3,
+            kupiec_pvalue=0.42,
+        )
+        response = self.client.get(f"/api/var-runs/{run.id}/")
+        self.assertIsNotNone(response.data["result"])
+        self.assertEqual(response.data["result"]["breach_count"], 3)
