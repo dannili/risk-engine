@@ -12,6 +12,7 @@ from risk.serializers import (
     VarRunSerializer,
 )
 from risk.services import compute_input_hash
+from risk.tasks import run_var_run
 
 
 # class PortfolioCreateView(generics.CreateAPIView):
@@ -63,9 +64,13 @@ class PortfolioVarRunsView(APIView):
                 run = VarRun.objects.create(
                     portfolio=portfolio, input_hash=input_hash, **data
                 )
+                # on_commit, not a bare .delay(), so the worker can never
+                # pick up run_id before this row is visible to it.
+                transaction.on_commit(lambda: run_var_run.delay(run.id))
         except IntegrityError:
             # Lost the race to a concurrent identical request; the other
-            # request's row is now committed, so fall back to returning it.
+            # request's row is now committed, so fall back to returning it
+            # without enqueuing a second task.
             run = VarRun.objects.get(input_hash=input_hash)
             return Response(
                 {"run_id": run.id, "status": run.status}, status=status.HTTP_200_OK

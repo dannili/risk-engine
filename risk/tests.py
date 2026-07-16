@@ -1,5 +1,6 @@
 import datetime
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase
@@ -242,3 +243,37 @@ class VarRunDetailApiTests(TestCase):
         response = self.client.get(f"/api/var-runs/{run.id}/")
         self.assertIsNotNone(response.data["result"])
         self.assertEqual(response.data["result"]["breach_count"], 3)
+
+
+class VarRunEnqueueTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.portfolio = Portfolio.objects.create(name="Test", base_currency="USD")
+        self.url = f"/api/portfolios/{self.portfolio.id}/var-runs/"
+        self.payload = {
+            "method": "historical",
+            "confidence": 0.95,
+            "lookback_days": 500,
+            "as_of_date": "2026-07-14",
+        }
+
+    def test_new_run_enqueues_exactly_one_task(self):
+        with patch("risk.views.run_var_run.delay") as mock_delay:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(self.url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, 202)
+        mock_delay.assert_called_once_with(response.data["run_id"])
+
+    def test_duplicate_submission_enqueues_no_task(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            first = self.client.post(self.url, self.payload, format="json")
+        self.assertEqual(first.status_code, 202)
+
+        with patch("risk.views.run_var_run.delay") as mock_delay:
+            with self.captureOnCommitCallbacks(execute=True):
+                second = self.client.post(self.url, self.payload, format="json")
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.data["run_id"], first.data["run_id"])
+        mock_delay.assert_not_called()
