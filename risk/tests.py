@@ -1,7 +1,9 @@
 import datetime
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import patch
 
+from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -277,3 +279,63 @@ class VarRunEnqueueTests(TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.data["run_id"], first.data["run_id"])
         mock_delay.assert_not_called()
+
+
+class LoadPricesCommandTests(TestCase):
+    @patch("risk.management.commands.load_prices.fetch_prices")
+    def test_loads_prices_and_prints_summary(self, mock_fetch):
+        mock_fetch.return_value = [
+            (datetime.date(2026, 1, 2), Decimal("100.00")),
+            (datetime.date(2026, 1, 3), Decimal("101.50")),
+        ]
+        out = StringIO()
+        call_command(
+            "load_prices", "aapl", "--start", "2026-01-01", "--end", "2026-01-05",
+            stdout=out,
+        )
+
+        self.assertEqual(PriceHistory.objects.filter(ticker="AAPL").count(), 2)
+        self.assertIn("AAPL: 2", out.getvalue())
+
+    @patch("risk.management.commands.load_prices.fetch_prices")
+    def test_rerunning_upserts_without_violating_unique_constraint(self, mock_fetch):
+        mock_fetch.return_value = [(datetime.date(2026, 1, 2), Decimal("100.00"))]
+        call_command("load_prices", "AAPL", "--start", "2026-01-01", "--end", "2026-01-05")
+        mock_fetch.return_value = [(datetime.date(2026, 1, 2), Decimal("105.00"))]
+        call_command("load_prices", "AAPL", "--start", "2026-01-01", "--end", "2026-01-05")
+
+        self.assertEqual(PriceHistory.objects.filter(ticker="AAPL").count(), 1)
+        self.assertEqual(
+            PriceHistory.objects.get(ticker="AAPL", date=datetime.date(2026, 1, 2)).close,
+            Decimal("105.00"),
+        )
+
+    @patch("risk.management.commands.load_prices.fetch_prices")
+    def test_ticker_with_no_data_warns_and_continues(self, mock_fetch):
+        mock_fetch.return_value = []
+        out, err = StringIO(), StringIO()
+        call_command(
+            "load_prices", "BADTICKER", "--start", "2026-01-01", "--end", "2026-01-05",
+            stdout=out, stderr=err,
+        )
+
+        self.assertIn("No data for BADTICKER", err.getvalue())
+        self.assertIn("BADTICKER: 0", out.getvalue())
+        self.assertEqual(PriceHistory.objects.filter(ticker="BADTICKER").count(), 0)
+
+    @patch("risk.management.commands.load_prices.fetch_prices")
+    def test_one_bad_ticker_does_not_stop_the_others(self, mock_fetch):
+        def side_effect(ticker, start, end):
+            if ticker == "GOOD":
+                return [(datetime.date(2026, 1, 2), Decimal("50.00"))]
+            return []
+
+        mock_fetch.side_effect = side_effect
+        out = StringIO()
+        call_command(
+            "load_prices", "GOOD", "BAD", "--start", "2026-01-01", "--end", "2026-01-05",
+            stdout=out, stderr=StringIO(),
+        )
+
+        self.assertEqual(PriceHistory.objects.filter(ticker="GOOD").count(), 1)
+        self.assertEqual(PriceHistory.objects.filter(ticker="BAD").count(), 0)
