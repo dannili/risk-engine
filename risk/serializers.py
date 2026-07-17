@@ -51,6 +51,7 @@ class VarRunSerializer(serializers.ModelSerializer):
             "status",
             "created_at",
             "completed_at",
+            "error",
             "result",
         ]
 

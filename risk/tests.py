@@ -10,6 +10,13 @@ from rest_framework.test import APIClient
 
 from risk.models import Portfolio, Position, PriceHistory, VarRun, VarResult
 from risk.services import compute_input_hash
+from risk.tasks import run_var_run
+from risk.var_engine import (
+    count_breaches,
+    expected_shortfall,
+    historical_var,
+    kupiec_pof_pvalue,
+)
 
 
 class PortfolioTests(TestCase):
@@ -339,3 +346,117 @@ class LoadPricesCommandTests(TestCase):
 
         self.assertEqual(PriceHistory.objects.filter(ticker="GOOD").count(), 1)
         self.assertEqual(PriceHistory.objects.filter(ticker="BAD").count(), 0)
+
+
+class HistoricalVarMathTests(TestCase):
+    # sorted ascending: -.04 -.03 -.02 -.01 -.005 .01 .01 .015 .02 .03
+    # confidence=0.90, n=10 -> index = floor(0.10*10) = 1 -> sorted[1] = -.03
+    RETURNS = [0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.015, -0.005, 0.01, -0.04]
+
+    def test_historical_var_known_series(self):
+        self.assertAlmostEqual(historical_var(self.RETURNS, confidence=0.90), 0.03)
+
+    def test_expected_shortfall_known_series(self):
+        # tail = sorted[:2] = [-.04, -.03] -> mean -.035 -> ES = .035
+        self.assertAlmostEqual(
+            expected_shortfall(self.RETURNS, confidence=0.90), 0.035
+        )
+
+    def test_empty_series_raises(self):
+        with self.assertRaises(ValueError):
+            historical_var([], confidence=0.90)
+
+
+class CountBreachesTests(TestCase):
+    def test_breach_counting_on_constructed_series(self):
+        # losses: .10 .06 .02 -.01 -.05 ; only .10 and .06 exceed .05
+        returns = [-0.10, -0.06, -0.02, 0.01, 0.05]
+        self.assertEqual(count_breaches(returns, var_value=0.05), 2)
+
+    def test_loss_equal_to_threshold_is_not_a_breach(self):
+        self.assertEqual(count_breaches([-0.05], var_value=0.05), 0)
+
+
+class KupiecPofTests(TestCase):
+    def test_pvalue_is_one_when_breach_rate_matches_expected_exactly(self):
+        # x/n = 5/100 = 0.05 = 1 - confidence -> LR statistic is exactly 0
+        pvalue = kupiec_pof_pvalue(breaches=5, n=100, confidence=0.95)
+        self.assertAlmostEqual(pvalue, 1.0, places=9)
+
+    def test_pvalue_is_tiny_when_breach_rate_is_wildly_off(self):
+        pvalue = kupiec_pof_pvalue(breaches=50, n=100, confidence=0.95)
+        self.assertLess(pvalue, 1e-10)
+
+
+class VarComputationTaskTests(TestCase):
+    def setUp(self):
+        self.portfolio = Portfolio.objects.create(name="Test", base_currency="USD")
+        Position.objects.create(portfolio=self.portfolio, ticker="AAPL", quantity=Decimal("10"))
+
+    @staticmethod
+    def _load_prices(ticker, closes, start_date):
+        for i, close in enumerate(closes):
+            PriceHistory.objects.create(
+                ticker=ticker,
+                date=start_date + datetime.timedelta(days=i),
+                close=Decimal(str(close)),
+            )
+
+    def test_successful_run_writes_result_and_completes(self):
+        closes = [100, 101, 99, 102, 98, 103, 97, 104, 96, 105, 95]  # 11 closes -> 10 returns
+        start = datetime.date(2026, 1, 1)
+        self._load_prices("AAPL", closes, start)
+        as_of_date = start + datetime.timedelta(days=len(closes) - 1)
+
+        run = VarRun.objects.create(
+            portfolio=self.portfolio,
+            confidence=0.90,
+            lookback_days=10,
+            as_of_date=as_of_date,
+            input_hash="hash-success",
+        )
+        run_var_run(run.id)  # call the task function directly, no broker needed
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, VarRun.Status.COMPLETE)
+        self.assertIsNotNone(run.completed_at)
+        self.assertIsNone(run.error)
+
+        result = run.results.get()
+        self.assertGreater(result.var_value, 0)
+        self.assertGreaterEqual(result.expected_shortfall, result.var_value)
+        self.assertGreaterEqual(result.breach_count, 0)
+        self.assertTrue(0 <= result.kupiec_pvalue <= 1)
+
+    def test_insufficient_data_sets_status_failed_with_error(self):
+        self._load_prices("AAPL", [100, 101, 99], datetime.date(2026, 1, 1))  # only 3, need 11
+
+        run = VarRun.objects.create(
+            portfolio=self.portfolio,
+            confidence=0.90,
+            lookback_days=10,
+            as_of_date=datetime.date(2026, 1, 3),
+            input_hash="hash-insufficient",
+        )
+        run_var_run(run.id)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, VarRun.Status.FAILED)
+        self.assertIsNotNone(run.completed_at)
+        self.assertIn("Insufficient price history", run.error)
+        self.assertEqual(run.results.count(), 0)
+
+    def test_portfolio_with_no_positions_fails(self):
+        empty_portfolio = Portfolio.objects.create(name="Empty", base_currency="USD")
+        run = VarRun.objects.create(
+            portfolio=empty_portfolio,
+            confidence=0.90,
+            lookback_days=10,
+            as_of_date=datetime.date(2026, 1, 1),
+            input_hash="hash-empty",
+        )
+        run_var_run(run.id)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, VarRun.Status.FAILED)
+        self.assertIn("no positions", run.error)
