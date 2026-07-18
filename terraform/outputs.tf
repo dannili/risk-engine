@@ -42,3 +42,13 @@ output "redis_port" {
   description = "ElastiCache Redis port"
   value       = aws_elasticache_cluster.redis.cache_nodes[0].port
 }
+
+output "db_password_secret_arn" {
+  description = "ARN of the Secrets Manager secret holding the RDS master password (for the ECS task definition)"
+  value       = aws_secretsmanager_secret.db_password.arn
+}
+
+output "ecr_repository_url" {
+  description = "URL of the risk-engine ECR repository (for docker push / task definition image)"
+  value       = aws_ecr_repository.app.repository_url
+}
