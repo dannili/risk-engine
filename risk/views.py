@@ -1,3 +1,5 @@
+import logging
+
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
@@ -13,6 +15,8 @@ from risk.serializers import (
 )
 from risk.services import compute_input_hash
 from risk.tasks import run_var_run
+
+logger = logging.getLogger(__name__)
 
 
 # class PortfolioCreateView(generics.CreateAPIView):
@@ -54,6 +58,10 @@ class PortfolioVarRunsView(APIView):
 
         existing = VarRun.objects.filter(input_hash=input_hash).first()
         if existing:
+            logger.info(
+                "run submitted",
+                extra={"run_id": existing.id, "cache_hit": True},
+            )
             return Response(
                 {"run_id": existing.id, "status": existing.status},
                 status=status.HTTP_200_OK,
@@ -72,10 +80,18 @@ class PortfolioVarRunsView(APIView):
             # request's row is now committed, so fall back to returning it
             # without enqueuing a second task.
             run = VarRun.objects.get(input_hash=input_hash)
+            logger.info(
+                "run submitted",
+                extra={"run_id": run.id, "cache_hit": True},
+            )
             return Response(
                 {"run_id": run.id, "status": run.status}, status=status.HTTP_200_OK
             )
 
+        logger.info(
+            "run submitted",
+            extra={"run_id": run.id, "cache_hit": False},
+        )
         return Response(
             {"run_id": run.id, "status": run.status}, status=status.HTTP_202_ACCEPTED
         )
