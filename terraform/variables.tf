@@ -15,3 +15,21 @@ variable "environment" {
   type        = string
   default     = "dev"
 }
+
+variable "db_name" {
+  description = "Name of the default database created on the RDS instance"
+  type        = string
+  default     = "riskengine"
+}
+
+variable "db_username" {
+  description = "Master username for the RDS instance"
+  type        = string
+  default     = "riskadmin"
+}
+
+variable "db_password" {
+  description = "Master password for the RDS instance"
+  type        = string
+  sensitive   = true
+}

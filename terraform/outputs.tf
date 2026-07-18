@@ -22,3 +22,13 @@ output "redis_security_group_id" {
   description = "ID of the redis security group (inbound 6379 from web only)"
   value       = aws_security_group.redis.id
 }
+
+output "rds_endpoint" {
+  description = "RDS Postgres endpoint address (host only, no port)"
+  value       = aws_db_instance.postgres.address
+}
+
+output "rds_port" {
+  description = "RDS Postgres port"
+  value       = aws_db_instance.postgres.port
+}
